@@ -49,7 +49,7 @@ So the dot shows:
 - **No dot** — **Peak** (Mon–Fri, 01:00–04:00 or 06:00–10:00 UTC)
 
 The state is derived from the current UTC time (the window is defined in UTC, not local time).
-A dedicated timer re-evaluates it **every 3 seconds** and redraws the icon from the last known VPN
+A dedicated timer re-evaluates it **every 60 seconds** and redraws the icon from the last known VPN
 status (without re-running `scutil`), so the dot flips almost immediately at each peak/off-peak
 boundary. The VPN status itself is refreshed on network-change events plus a 60s fallback poll.
 
