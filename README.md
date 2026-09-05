@@ -29,7 +29,29 @@ Or double-click `VPNIndicator.app` in Finder. Since it runs as a menu bar access
 
 - **Left-click** the dot toggles the target VPN (connect if disconnected, disconnect if connected).
 - **Right-click** (or ⌃-click) opens the menu: Toggle VPN, Refresh Now, Quit.
-- The tooltip shows which VPNs are currently connected.
+- The tooltip shows which VPNs are currently connected and the DeepSeek Peak/Off-Peak state.
+
+A **4×4 px white round dot** in the top-right corner of the status icon shows DeepSeek's current
+**Peak** (`P`) / **Off-Peak** (`O/P`) pricing period:
+- **Dot present** = Off-Peak (`O/P`)
+- **No dot** = Peak (`P`)
+
+### DeepSeek Peak / Off-Peak schedule
+
+The indicator uses DeepSeek's official pricing schedule
+([DeepSeek API docs → Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing)):
+
+> Off-peak rates are half of the peak rates. **Peak hours are 01:00–04:00 and 06:00–10:00 UTC,
+> Monday through Friday** (all other hours are off-peak).
+
+So the dot shows:
+- **Dot present** — **Off-Peak** (everything except the windows below, including the entire weekend)
+- **No dot** — **Peak** (Mon–Fri, 01:00–04:00 or 06:00–10:00 UTC)
+
+The state is derived from the current UTC time (the window is defined in UTC, not local time).
+A dedicated timer re-evaluates it **every 3 seconds** and redraws the icon from the last known VPN
+status (without re-running `scutil`), so the dot flips almost immediately at each peak/off-peak
+boundary. The VPN status itself is refreshed on network-change events plus a 60s fallback poll.
 
 ## How it decides
 

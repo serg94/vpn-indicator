@@ -60,11 +60,49 @@ enum VPNStatusChecker {
     }
 }
 
+/// Determines whether DeepSeek is currently in a Peak or Off-Peak pricing period.
+///
+/// Source: DeepSeek API docs → Models & Pricing → footnote.
+/// https://api-docs.deepseek.com/quick_start/pricing
+///
+/// Official schedule (as of Aug 2026): off-peak rates are half the peak rates.
+/// Peak hours are **01:00–04:00** and **06:00–10:00 UTC, Monday through Friday**;
+/// all other hours (including the whole weekend) are off-peak.
+enum DeepSeekPricing {
+    enum Period {
+        case peak    // P — Peak
+        case offPeak // O/P — Off-Peak
+    }
+
+    static func currentPeriod(now: Date = Date()) -> Period {
+        // Evaluate the schedule in UTC (DeepSeek prices are defined per UTC).
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let c = calendar.dateComponents([.weekday, .hour, .minute], from: now)
+
+        guard let weekday = c.weekday, // 1 = Sunday … 7 = Saturday
+              let hour = c.hour,
+              let minute = c.minute else {
+            return .peak
+        }
+
+        // Peak only Monday–Friday (weekday 2…6); weekends are always off-peak.
+        let isWeekday = (2...6).contains(weekday)
+        guard isWeekday else { return .offPeak }
+
+        let minutes = hour * 60 + minute
+        let inMorningWindow = minutes >= 1 * 60 && minutes < 4 * 60   // 01:00–04:00
+        let inLateWindow   = minutes >= 6 * 60 && minutes < 10 * 60   // 06:00–10:00
+        return (inMorningWindow || inLateWindow) ? .peak : .offPeak
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var statusMenuItem: NSMenuItem?
     private var statusMenu: NSMenu?
     private var timer: Timer?
+    private var deepSeekTimer: Timer?
     private var dynamicStore: SCDynamicStore?
     private var pendingRefresh: DispatchWorkItem?
     private var toggleInProgress = false
@@ -73,6 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var loadingTimer: Timer?
     private var loadingPollTimer: Timer?
     private var loadingTimeoutWork: DispatchWorkItem?
+    private var lastStatus: VPNStatus?
     private let checkQueue = DispatchQueue(label: "com.example.vpnindicator.check", qos: .utility)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -81,7 +120,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            button.image = Self.indicatorImage(filled: false, color: .labelColor)
+            button.image = Self.indicatorImage(
+                filled: false,
+                color: .labelColor,
+                deepSeekColor: Self.deepSeekColor(for: DeepSeekPricing.currentPeriod()))
             button.toolTip = "VPN not connected"
             button.target = self
             button.action = #selector(handleClick)
@@ -120,6 +162,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                      selector: #selector(refreshNow),
                                      userInfo: nil,
                                      repeats: true)
+
+        // Dedicated time check so the DeepSeek Peak/Off-Peak dot stays current
+        // as the clock crosses the peak/off-peak boundary times. It only
+        // re-evaluates the time and redraws the icon from the last known VPN
+        // status — it does not re-run `scutil`.
+        deepSeekTimer = Timer.scheduledTimer(timeInterval: 60.0,
+                                             target: self,
+                                             selector: #selector(updateDeepSeekIndicator),
+                                             userInfo: nil,
+                                             repeats: true)
     }
 
     @objc private func refreshNow() {
@@ -129,6 +181,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.apply(status)
             }
         }
+    }
+
+    /// Re-evaluates the DeepSeek Peak/Off-Peak state from the current time and
+    /// redraws the icon using the last known VPN status (no `scutil` call).
+    /// Skipped while a VPN toggle is in flight so it never interrupts the spinner.
+    @objc private func updateDeepSeekIndicator() {
+        guard !toggleInProgress, let status = lastStatus else { return }
+        render(status)
     }
 
     @objc private func handleClick(_ sender: NSStatusBarButton) {
@@ -180,7 +240,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginLoadingUI() {
         loadingStartTime = Date().timeIntervalSinceReferenceDate
-        statusItem.button?.image = Self.loadingImage(startAngleDeg: 0, sweepDeg: 20)
+        statusItem.button?.image = Self.loadingImage(
+            startAngleDeg: 0,
+            sweepDeg: 20,
+            deepSeekColor: Self.deepSeekColor(for: DeepSeekPricing.currentPeriod()))
         statusItem.button?.toolTip = expectedTargetConnected ? "Connecting…" : "Disconnecting…"
         statusMenuItem?.title = expectedTargetConnected ? "Connecting…" : "Disconnecting…"
 
@@ -213,7 +276,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let p = (t / 1.6) * 2 * .pi
         let startDeg = CGFloat((t / 1.6) * 1.2 * 360)
         let sweepDeg = CGFloat(20 + 270 * (0.5 - 0.5 * cos(p)))
-        statusItem.button?.image = Self.loadingImage(startAngleDeg: startDeg, sweepDeg: sweepDeg)
+        statusItem.button?.image = Self.loadingImage(
+            startAngleDeg: startDeg,
+            sweepDeg: sweepDeg,
+            deepSeekColor: Self.deepSeekColor(for: DeepSeekPricing.currentPeriod()))
     }
 
     private func clearLoadingUI() {
@@ -299,17 +365,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func render(_ status: VPNStatus) {
+        lastStatus = status
+        let period = DeepSeekPricing.currentPeriod()
+        let deepSeekColor = Self.deepSeekColor(for: period)
         let image = status.connected
-            ? Self.indicatorImage(filled: true, color: .labelColor)
-            : Self.indicatorImage(filled: false, color: .labelColor)
+            ? Self.indicatorImage(filled: true, color: .labelColor, deepSeekColor: deepSeekColor)
+            : Self.indicatorImage(filled: false, color: .labelColor, deepSeekColor: deepSeekColor)
         statusItem.button?.image = image
 
+        let deepSeekLabel = period == .peak ? "Peak" : "Off-Peak"
         if status.connected {
             let names = status.connectedNames.joined(separator: ", ")
-            statusItem.button?.toolTip = "Connected: \(names)"
+            statusItem.button?.toolTip = "Connected: \(names) · DeepSeek \(deepSeekLabel)"
             statusMenuItem?.title = "Connected: \(names)"
         } else {
-            statusItem.button?.toolTip = "VPN not connected"
+            statusItem.button?.toolTip = "VPN not connected · DeepSeek \(deepSeekLabel)"
             statusMenuItem?.title = "Not connected"
         }
     }
@@ -319,7 +389,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Draws the status glyph: a filled dot when connected, a hollow circle when not.
-    private static func indicatorImage(filled: Bool, color: NSColor) -> NSImage {
+    /// The glyph is the original full size (inset 3); the small DeepSeek badge in
+    /// the top-right corner is drawn small enough not to intersect it.
+    private static func indicatorImage(filled: Bool,
+                                       color: NSColor,
+                                       deepSeekColor: NSColor?) -> NSImage {
         let side: CGFloat = 20
         let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
             let dotRect = rect.insetBy(dx: 3, dy: 3)
@@ -332,6 +406,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 path.lineWidth = 2
                 path.stroke()
             }
+            if let deepSeekColor {
+                Self.drawDeepSeekBadge(in: rect, color: deepSeekColor)
+            }
             return true
         }
         image.isTemplate = false
@@ -339,7 +416,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Google-style spinner: a single arc that grows and shrinks while rotating.
-    private static func loadingImage(startAngleDeg: CGFloat, sweepDeg: CGFloat) -> NSImage {
+    private static func loadingImage(startAngleDeg: CGFloat,
+                                     sweepDeg: CGFloat,
+                                     deepSeekColor: NSColor?) -> NSImage {
         let side: CGFloat = 20
         let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
             let dotRect = rect.insetBy(dx: 4, dy: 4)
@@ -353,10 +432,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             path.lineWidth = 2
             path.lineCapStyle = .round
             path.stroke()
+            if let deepSeekColor {
+                Self.drawDeepSeekBadge(in: rect, color: deepSeekColor)
+            }
             return true
         }
         image.isTemplate = false
         return image
+    }
+
+    /// Returns the color for the DeepSeek state dot (white), or `nil` when no dot
+    /// should be shown (Peak). The dot is only shown during **Off-Peak** hours
+    /// (dot present = off-peak, dot absent = peak).
+    private static func deepSeekColor(for period: DeepSeekPricing.Period) -> NSColor? {
+        guard period == .offPeak else { return nil }
+        return .white
+    }
+
+    /// Draws a 4×4 px DeepSeek state dot as a white circle in the top-right corner,
+    /// flush against the icon's corner so it stays clear of the VPN glyph.
+    private static func drawDeepSeekBadge(in rect: NSRect, color: NSColor) {
+        let side = rect.width
+        let size: CGFloat = 4
+        let badgeRect = NSRect(x: side - size, y: side - size, width: size, height: size)
+        color.setFill()
+        NSBezierPath(ovalIn: badgeRect).fill()
     }
 }
 
