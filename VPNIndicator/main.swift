@@ -109,8 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var toggleInProgress = false
     private var expectedTargetConnected = false
     private var loadingStartTime: TimeInterval = 0
-    private var loadingTimer: Timer?
-    private var spinnerDisplayLink: AnyObject?
+    private var spinnerArcLayer: CAShapeLayer?
     private var spinnerBadgeColor: NSColor?
     private var animationActivity: NSObjectProtocol?
     private var loadingPollTimer: Timer?
@@ -244,50 +243,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginLoadingUI() {
         loadingStartTime = Date().timeIntervalSinceReferenceDate
-        // Resolve the DeepSeek badge colour once per animation instead of
-        // rebuilding a UTC Calendar on every frame (60x/second of wasted work).
+        // The badge is a static image; the spinning arc is a Core Animation layer
+        // (see startSpinnerAnimation). Nothing about the animation runs on our
+        // main thread any more, so status polling and dynamic-store handling can
+        // no longer stall or skip a frame.
         spinnerBadgeColor = Self.deepSeekColor(for: DeepSeekPricing.currentPeriod())
-        statusItem.button?.image = Self.loadingImage(
-            startAngleDeg: 0,
-            sweepDeg: 20,
-            deepSeekColor: spinnerBadgeColor)
+        statusItem.button?.image = Self.badgeImage(deepSeekColor: spinnerBadgeColor)
         statusItem.button?.toolTip = expectedTargetConnected ? "Connecting…" : "Disconnecting…"
         statusMenuItem?.title = expectedTargetConnected ? "Connecting…" : "Disconnecting…"
 
-        // A menu bar accessory app is App-Napped, which coalesces and throttles
-        // its timers -- the usual reason such spinners look choppy. Hold a
-        // user-initiated activity for the duration of the animation.
+        // Held so App Nap cannot throttle the 1 s status poll while the spinner is
+        // up; the arc itself no longer depends on us at all.
         if animationActivity == nil {
             animationActivity = ProcessInfo.processInfo.beginActivity(
                 options: .userInitiated,
                 reason: "VPN toggle spinner")
         }
 
-        stopSpinnerAnimation()
-
-        // Drive frames from the display's refresh cadence when available so they
-        // land on vsync instead of beating against it; a free-running 60 Hz timer
-        // stays as the fallback for older systems.
-        if #available(macOS 14.0, *), let button = statusItem.button {
-            let link = button.displayLink(target: self, selector: #selector(advanceSpinner(_:)))
-            // Use the display's native refresh instead of hard-capping at 60 Hz.
-            // ProMotion panels run at 120 Hz, which halves the rotation step per
-            // frame and visibly smooths the spin. The system clamps this to what
-            // the screen actually supports, so it stays correct on 60 Hz displays.
-            let maxFPS = Float(NSScreen.main?.maximumFramesPerSecond ?? 60)
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: maxFPS, preferred: maxFPS)
-            link.add(to: .main, forMode: .common)
-            spinnerDisplayLink = link
-        } else {
-            let spinnerTimer = Timer(timeInterval: 1.0 / 60.0,
-                                     target: self,
-                                     selector: #selector(advanceSpinner(_:)),
-                                     userInfo: nil,
-                                     repeats: true)
-            spinnerTimer.tolerance = 0
-            RunLoop.main.add(spinnerTimer, forMode: .common)
-            loadingTimer = spinnerTimer
-        }
+        startSpinnerAnimation()
 
         loadingPollTimer?.invalidate()
         loadingPollTimer = Timer.scheduledTimer(timeInterval: 1.0,
@@ -304,24 +277,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20.0, execute: work)
     }
 
-    /// Same drawing and the same maths as before -- only the frame source changed.
-    @objc private func advanceSpinner(_ sender: Any?) {
-        let t = Date().timeIntervalSinceReferenceDate - loadingStartTime
+    /// Width/height of the drawn icon, matching the settled glyph images.
+    private static let iconSide: CGFloat = 20
+
+    /// Sweep of the spinner arc `t` seconds into the cycle, as a fraction of a
+    /// full circle. Identical maths to the previous image-based spinner.
+    private static func sweepFraction(at t: Double) -> CGFloat {
         let p = (t / 1.6) * 2 * .pi
-        let startDeg = CGFloat((t / 1.6) * 1.2 * 360)
-        let sweepDeg = CGFloat(20 + 270 * (0.5 - 0.5 * cos(p)))
-        statusItem.button?.image = Self.loadingImage(
-            startAngleDeg: startDeg,
-            sweepDeg: sweepDeg,
-            deepSeekColor: spinnerBadgeColor)
+        return CGFloat((20 + 270 * (0.5 - 0.5 * cos(p))) / 360.0)
+    }
+
+    /// Hands the spinner to Core Animation: one shape layer whose stroke sweeps
+    /// while the layer rotates. Core Animation interpolates on the render server,
+    /// so the spin cannot be stalled by anything the app does on the main thread.
+    private func startSpinnerAnimation() {
+        guard let button = statusItem.button else { return }
+        button.wantsLayer = true
+        stopSpinnerAnimation()
+
+        let layer = CAShapeLayer()
+        layer.frame = CGRect(x: (button.bounds.width - Self.iconSide) / 2,
+                             y: (button.bounds.height - Self.iconSide) / 2,
+                             width: Self.iconSide,
+                             height: Self.iconSide)
+        let path = CGMutablePath()
+        path.addArc(center: CGPoint(x: Self.iconSide / 2, y: Self.iconSide / 2),
+                    radius: 6,
+                    startAngle: 0,
+                    endAngle: .pi * 2,
+                    clockwise: true)
+        layer.path = path
+        layer.fillColor = nil
+        layer.lineWidth = 2
+        layer.lineCap = .round
+        layer.strokeStart = 0
+        layer.strokeEnd = Self.sweepFraction(at: 0)
+
+        // Rasterise at the screen's scale, otherwise the vector arc is drawn at
+        // 1x and upscaled, which shows up as a fatter, blurry stroke.
+        layer.contentsScale = button.layer?.contentsScale
+            ?? NSScreen.main?.backingScaleFactor ?? 2
+
+        // Resolve labelColor against the menu bar's appearance, not the app's.
+        button.effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer.strokeColor = NSColor.labelColor.cgColor
+        }
+
+        let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
+        rotation.fromValue = 0.0
+        rotation.toValue = 2 * Double.pi
+        rotation.duration = 360.0 / 270.0   // the original advanced startDeg 270 deg/s
+        rotation.repeatCount = .infinity
+        layer.add(rotation, forKey: "rotation")
+
+        let steps = 64
+        let sweep = CAKeyframeAnimation(keyPath: "strokeEnd")
+        sweep.values = (0...steps).map { Self.sweepFraction(at: Double($0) / Double(steps) * 1.6) }
+        sweep.keyTimes = (0...steps).map { NSNumber(value: Double($0) / Double(steps)) }
+        sweep.duration = 1.6
+        sweep.repeatCount = .infinity
+        sweep.calculationMode = .linear
+        layer.add(sweep, forKey: "sweep")
+
+        button.layer?.addSublayer(layer)
+        spinnerArcLayer = layer
     }
 
     private func stopSpinnerAnimation() {
-        loadingTimer?.invalidate(); loadingTimer = nil
-        if #available(macOS 14.0, *) {
-            (spinnerDisplayLink as? CADisplayLink)?.invalidate()
-        }
-        spinnerDisplayLink = nil
+        spinnerArcLayer?.removeAllAnimations()
+        spinnerArcLayer?.removeFromSuperlayer()
+        spinnerArcLayer = nil
     }
 
     private func clearLoadingUI() {
@@ -462,23 +487,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return image
     }
 
-    /// Google-style spinner: a single arc that grows and shrinks while rotating.
-    private static func loadingImage(startAngleDeg: CGFloat,
-                                     sweepDeg: CGFloat,
-                                     deepSeekColor: NSColor?) -> NSImage {
-        let side: CGFloat = 20
-        let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
-            let dotRect = rect.insetBy(dx: 4, dy: 4)
-            NSColor.labelColor.setStroke()
-            let path = NSBezierPath()
-            path.appendArc(withCenter: NSPoint(x: dotRect.midX, y: dotRect.midY),
-                           radius: dotRect.width / 2,
-                           startAngle: startAngleDeg,
-                           endAngle: startAngleDeg + sweepDeg,
-                           clockwise: true)
-            path.lineWidth = 2
-            path.lineCapStyle = .round
-            path.stroke()
+    /// Just the DeepSeek badge, used while the arc is drawn by Core Animation
+    /// instead of being baked into a single spinner image.
+    private static func badgeImage(deepSeekColor: NSColor?) -> NSImage {
+        let image = NSImage(size: NSSize(width: iconSide, height: iconSide), flipped: false) { rect in
             if let deepSeekColor {
                 Self.drawDeepSeekBadge(in: rect, color: deepSeekColor)
             }
