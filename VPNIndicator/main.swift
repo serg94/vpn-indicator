@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import QuartzCore
 import SystemConfiguration
 
 /// The VPN the indicator toggles on click (name as shown by `scutil --nc list`).
@@ -109,6 +110,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var expectedTargetConnected = false
     private var loadingStartTime: TimeInterval = 0
     private var loadingTimer: Timer?
+    private var spinnerDisplayLink: AnyObject?
+    private var spinnerBadgeColor: NSColor?
+    private var animationActivity: NSObjectProtocol?
     private var loadingPollTimer: Timer?
     private var loadingTimeoutWork: DispatchWorkItem?
     private var lastStatus: VPNStatus?
@@ -240,21 +244,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginLoadingUI() {
         loadingStartTime = Date().timeIntervalSinceReferenceDate
+        // Resolve the DeepSeek badge colour once per animation instead of
+        // rebuilding a UTC Calendar on every frame (60x/second of wasted work).
+        spinnerBadgeColor = Self.deepSeekColor(for: DeepSeekPricing.currentPeriod())
         statusItem.button?.image = Self.loadingImage(
             startAngleDeg: 0,
             sweepDeg: 20,
-            deepSeekColor: Self.deepSeekColor(for: DeepSeekPricing.currentPeriod()))
+            deepSeekColor: spinnerBadgeColor)
         statusItem.button?.toolTip = expectedTargetConnected ? "Connecting…" : "Disconnecting…"
         statusMenuItem?.title = expectedTargetConnected ? "Connecting…" : "Disconnecting…"
 
-        loadingTimer?.invalidate()
-        let spinnerTimer = Timer(timeInterval: 1.0 / 60.0,
-                                 target: self,
-                                 selector: #selector(advanceSpinner),
-                                 userInfo: nil,
-                                 repeats: true)
-        RunLoop.main.add(spinnerTimer, forMode: .common)
-        loadingTimer = spinnerTimer
+        // A menu bar accessory app is App-Napped, which coalesces and throttles
+        // its timers -- the usual reason such spinners look choppy. Hold a
+        // user-initiated activity for the duration of the animation.
+        if animationActivity == nil {
+            animationActivity = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiated,
+                reason: "VPN toggle spinner")
+        }
+
+        stopSpinnerAnimation()
+
+        // Drive frames from the display's refresh cadence when available so they
+        // land on vsync instead of beating against it; a free-running 60 Hz timer
+        // stays as the fallback for older systems.
+        if #available(macOS 14.0, *), let button = statusItem.button {
+            let link = button.displayLink(target: self, selector: #selector(advanceSpinner(_:)))
+            // Use the display's native refresh instead of hard-capping at 60 Hz.
+            // ProMotion panels run at 120 Hz, which halves the rotation step per
+            // frame and visibly smooths the spin. The system clamps this to what
+            // the screen actually supports, so it stays correct on 60 Hz displays.
+            let maxFPS = Float(NSScreen.main?.maximumFramesPerSecond ?? 60)
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: maxFPS, preferred: maxFPS)
+            link.add(to: .main, forMode: .common)
+            spinnerDisplayLink = link
+        } else {
+            let spinnerTimer = Timer(timeInterval: 1.0 / 60.0,
+                                     target: self,
+                                     selector: #selector(advanceSpinner(_:)),
+                                     userInfo: nil,
+                                     repeats: true)
+            spinnerTimer.tolerance = 0
+            RunLoop.main.add(spinnerTimer, forMode: .common)
+            loadingTimer = spinnerTimer
+        }
 
         loadingPollTimer?.invalidate()
         loadingPollTimer = Timer.scheduledTimer(timeInterval: 1.0,
@@ -271,7 +304,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20.0, execute: work)
     }
 
-    @objc private func advanceSpinner() {
+    /// Same drawing and the same maths as before -- only the frame source changed.
+    @objc private func advanceSpinner(_ sender: Any?) {
         let t = Date().timeIntervalSinceReferenceDate - loadingStartTime
         let p = (t / 1.6) * 2 * .pi
         let startDeg = CGFloat((t / 1.6) * 1.2 * 360)
@@ -279,14 +313,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = Self.loadingImage(
             startAngleDeg: startDeg,
             sweepDeg: sweepDeg,
-            deepSeekColor: Self.deepSeekColor(for: DeepSeekPricing.currentPeriod()))
+            deepSeekColor: spinnerBadgeColor)
+    }
+
+    private func stopSpinnerAnimation() {
+        loadingTimer?.invalidate(); loadingTimer = nil
+        if #available(macOS 14.0, *) {
+            (spinnerDisplayLink as? CADisplayLink)?.invalidate()
+        }
+        spinnerDisplayLink = nil
     }
 
     private func clearLoadingUI() {
         toggleInProgress = false
-        loadingTimer?.invalidate(); loadingTimer = nil
+        stopSpinnerAnimation()
         loadingPollTimer?.invalidate(); loadingPollTimer = nil
         loadingTimeoutWork?.cancel(); loadingTimeoutWork = nil
+        spinnerBadgeColor = nil
+        if let activity = animationActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            animationActivity = nil
+        }
     }
 
     private func endLoading() {
