@@ -478,7 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// per press. Ownership is settled here instead: an exclusive advisory lock
     /// (flock) on a file in Application Support marks the single instance allowed
     /// to register the hot key. The kernel drops that lock automatically when its
-    /// owner exits, so every other instance retries every couple of seconds and
+    /// owner exits, so every other instance retries every few minutes and
     /// the first one to win takes the shortcut over.
     ///
     /// Carbon remains the registration mechanism because it is the only API that
@@ -502,7 +502,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         close(descriptor)
         NSLog("VPNIndicator: another instance owns ⌘⇧P, standing by")
-        hotKeyStandbyTimer = Timer.scheduledTimer(timeInterval: 2.0,
+        hotKeyStandbyTimer = Timer.scheduledTimer(timeInterval: Self.hotKeyStandbyInterval,
                                                   target: self,
                                                   selector: #selector(retryHotKeyOwnership),
                                                   userInfo: nil,
@@ -537,6 +537,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                               0o644)
         return descriptor >= 0 ? descriptor : nil
     }
+
+    /// How often a standby instance re-tries for the shortcut. Kept deliberately
+    /// slow: the retry touches the filesystem (open + flock), and nothing about
+    /// the shortcut is urgent enough to justify running it every couple of
+    /// seconds. A clean Quit releases the lock immediately, so this interval is
+    /// only ever paid after a crash or a kill.
+    private static let hotKeyStandbyInterval: TimeInterval = 180.0   // 3 min
 
     /// Installs the Carbon hot key. Only the lock owner should call this.
     private func registerGlobalHotKey() {
@@ -600,7 +607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quit() {
         // Releasing the lock lets another instance pick up ⌘⇧P at once
-        // instead of on its next 2 s retry.
+        // instead of on its next 3-minute retry.
         if hotKeyLockDescriptor >= 0 {
             close(hotKeyLockDescriptor)
             hotKeyLockDescriptor = -1

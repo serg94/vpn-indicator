@@ -84,8 +84,10 @@ Launchd discards an app’s stderr, so to see them run the binary from a termina
 
 If several copies of the app are running, only **one** of them answers ⌘⇧P. Each instance tries to take
 an exclusive lock on `~/Library/Application Support/VPNIndicator/hotkey.lock` at launch, and only the lock
-owner registers the shortcut; the others stand by and take over within ~2 s if the owner quits (the
-kernel releases the lock when its owner dies). This is necessary because macOS delivers a registered
+owner registers the shortcut; the others stand by and take over if the owner exits (the kernel releases
+the lock when its owner dies). A clean **Quit** hands the shortcut over immediately; a crash or `kill`
+can leave it unowned for up to the 3-minute retry interval — deliberately slow so the standby check
+does not keep touching the disk. This is necessary because macOS delivers a registered
 hot key to *every* process that registered it — without the lock, one press would toggle the VPN once
 per running copy. The click-toggle keeps working even if registration fails.
 
