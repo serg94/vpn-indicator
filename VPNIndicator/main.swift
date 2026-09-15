@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import Foundation
 import QuartzCore
 import SystemConfiguration
@@ -116,6 +117,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var loadingTimeoutWork: DispatchWorkItem?
     private var lastStatus: VPNStatus?
     private let checkQueue = DispatchQueue(label: "com.example.vpnindicator.check", qos: .utility)
+    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyHandlerRef: EventHandlerRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Run as a menu bar accessory: no Dock icon, no app menu.
@@ -141,7 +144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        let toggleItem = NSMenuItem(title: "Toggle VPN", action: #selector(toggleVPN), keyEquivalent: "t")
+        // The real (system-wide) shortcut is registered with Carbon in
+        // installGlobalHotKey(); this key equivalent only exists so the menu
+        // displays ⌘⇧P next to the item.
+        let toggleItem = NSMenuItem(title: "Toggle VPN", action: #selector(toggleVPN), keyEquivalent: "p")
+        toggleItem.keyEquivalentModifierMask = [.command, .shift]
         toggleItem.target = self
         menu.addItem(toggleItem)
 
@@ -157,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         refreshNow()
         startMonitoringNetworkChanges()
+        installGlobalHotKey()
 
         // Slow fallback poll: the dynamic store handles the normal case,
         // but keep a periodic safety net in case a change is ever missed.
@@ -454,6 +462,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.toolTip = "VPN not connected · DeepSeek \(deepSeekLabel)"
             statusMenuItem?.title = "Not connected"
         }
+    }
+
+    // MARK: - Global hot key (⌘⇧P)
+
+    /// Registers ⌘⇧P system-wide using the Carbon hot key API.
+    ///
+    /// This is the only way for an accessory (LSUIElement) app to get a true
+    /// global shortcut without asking the user for a TCC permission:
+    /// a menu key equivalent is never consulted because this app is never the
+    /// active application, and `NSEvent.addGlobalMonitorForEvents` requires the
+    /// Accessibility permission (plus Input Monitoring on newer systems).
+    private func installGlobalHotKey() {
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                      eventKind: UInt32(kEventHotKeyPressed))
+
+        let handlerStatus = InstallEventHandler(GetEventDispatcherTarget(),
+                                                Self.hotKeyHandler,
+                                                1,
+                                                &eventType,
+                                                Unmanaged.passUnretained(self).toOpaque(),
+                                                &hotKeyHandlerRef)
+        guard handlerStatus == noErr else {
+            NSLog("VPNIndicator: hot key handler install failed (\(handlerStatus))")
+            return
+        }
+
+        let hotKeyID = EventHotKeyID(signature: Self.hotKeySignature, id: 1)
+        let status = RegisterEventHotKey(UInt32(kVK_ANSI_P),
+                                         Self.hotKeyModifiers,
+                                         hotKeyID,
+                                         GetEventDispatcherTarget(),
+                                         0,
+                                         &hotKeyRef)
+        if status == noErr {
+            // Logged so a successful registration is verifiable after launch
+            // (Console.app, or: log show --predicate 'process == "VPNIndicator"').
+            NSLog("VPNIndicator: registered global hot key ⌘⇧P")
+        } else {
+            // e.g. another app (or the system) already owns ⌘⇧P.
+            NSLog("VPNIndicator: could not register ⌘⇧P (\(status))")
+        }
+    }
+
+    /// Four-character code 'VPNI' — identifies our hot key in the event callback.
+    private static let hotKeySignature: OSType = 0x56504E49
+
+    /// Carbon modifier mask for ⌘⇧ (cmdKey | shiftKey).
+    private static let hotKeyModifiers = UInt32(cmdKey | shiftKey)
+
+    /// C event callback. It cannot be a closure over `self` (C function pointers
+    /// cannot capture), so the delegate is handed over through `userData`.
+    /// Carbon dispatches this on the main thread, which is where toggleVPN() lives.
+    private static let hotKeyHandler: EventHandlerUPP = { _, event, userData in
+        guard let event, let userData else { return noErr }
+
+        var hotKeyID = EventHotKeyID()
+        let err = GetEventParameter(event,
+                                    EventParamName(kEventParamDirectObject),
+                                    EventParamType(typeEventHotKeyID),
+                                    nil,
+                                    MemoryLayout<EventHotKeyID>.size,
+                                    nil,
+                                    &hotKeyID)
+        guard err == noErr, hotKeyID.signature == AppDelegate.hotKeySignature else { return noErr }
+
+        let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+        delegate.toggleVPN()
+        return noErr
     }
 
     @objc private func quit() {

@@ -29,6 +29,7 @@ Or double-click `VPNIndicator.app` in Finder. Since it runs as a menu bar access
 
 - **Left-click** the dot toggles the target VPN (connect if disconnected, disconnect if connected).
 - **Right-click** (or ⌃-click) opens the menu: Toggle VPN, Refresh Now, Quit.
+- **⌘⇧P** toggles the target VPN from **anywhere** (a true system-wide shortcut — see below).
 - The tooltip shows which VPNs are currently connected and the DeepSeek Peak/Off-Peak state.
 
 A **4×4 px white round dot** in the top-right corner of the status icon shows DeepSeek's current
@@ -58,6 +59,32 @@ boundary. The VPN status itself is refreshed on network-change events plus a 60s
 - It runs `scutil --nc list` and looks for any line containing `(Connected)`.
 - Black filled dot = at least one VPN is connected (the connected VPN names appear in the tooltip).
 - Black hollow circle = no VPN is connected.
+
+## Global shortcut: ⌘⇧P
+
+Pressing **⌘⇧P** while any app is frontmost toggles the target VPN — exactly the same code path as
+left-clicking the menu bar dot (it is guarded, so a second press while a toggle is already in flight
+is ignored).
+
+It is registered in `installGlobalHotKey()` with Carbon's `RegisterEventHotKey`, which is the only
+approach that works for a menu bar accessory app **without asking for any permission**:
+
+| Approach | Works globally? | Permission needed |
+| --- | --- | --- |
+| `NSMenuItem.keyEquivalent` | ✗ — the app is never the active app, so its menu is never consulted | none |
+| `NSEvent.addGlobalMonitorForEvents` | ✓ | **Accessibility** (plus Input Monitoring on newer macOS) |
+| `RegisterEventHotKey` (used here) | ✓ | none |
+
+Registration problems are reported on **stderr** (“registered global hot key ⌘⇧P” / “could not register ⌘⇧P”).
+Launchd discards an app’s stderr, so to see them run the binary from a terminal:
+
+```bash
+~/Applications/VPNIndicator.app/Contents/MacOS/VPNIndicator
+```
+
+The click-toggle keeps working even if the shortcut could not be registered. Note that macOS allows
+the same hot key to be registered by several processes, so running a second copy of the app (e.g.
+`open build/VPNIndicator.app`) makes both of them fire on one press — keep a single instance running.
 
 ## Customizing
 
