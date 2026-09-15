@@ -119,6 +119,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let checkQueue = DispatchQueue(label: "com.example.vpnindicator.check", qos: .utility)
     private var hotKeyRef: EventHotKeyRef?
     private var hotKeyHandlerRef: EventHandlerRef?
+    /// Kept open for the lifetime of the process: the exclusive lock on this
+    /// file is what makes this instance the one that answers ⌘⇧P.
+    /// -1 means this instance does not own the shortcut.
+    private var hotKeyLockDescriptor: Int32 = -1
+    private var hotKeyStandbyTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Run as a menu bar accessory: no Dock icon, no app menu.
@@ -466,14 +471,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Global hot key (⌘⇧P)
 
-    /// Registers ⌘⇧P system-wide using the Carbon hot key API.
+    /// Decides which instance answers ⌘⇧P, then registers it there.
     ///
-    /// This is the only way for an accessory (LSUIElement) app to get a true
-    /// global shortcut without asking the user for a TCC permission:
-    /// a menu key equivalent is never consulted because this app is never the
-    /// active application, and `NSEvent.addGlobalMonitorForEvents` requires the
-    /// Accessibility permission (plus Input Monitoring on newer systems).
+    /// macOS lets *every* process register the same hot key and then delivers the
+    /// press to all of them, so N copies of the app would run the toggle N times
+    /// per press. Ownership is settled here instead: an exclusive advisory lock
+    /// (flock) on a file in Application Support marks the single instance allowed
+    /// to register the hot key. The kernel drops that lock automatically when its
+    /// owner exits, so every other instance retries every couple of seconds and
+    /// the first one to win takes the shortcut over.
+    ///
+    /// Carbon remains the registration mechanism because it is the only API that
+    /// gives an accessory (LSUIElement) app a true global shortcut with no TCC
+    /// permission: a menu key equivalent is never consulted since this app is
+    /// never the active application, and NSEvent.addGlobalMonitorForEvents needs
+    /// the Accessibility permission.
     private func installGlobalHotKey() {
+        guard let descriptor = openHotKeyLockFile() else {
+            // No Application Support directory: run anyway. A working shortcut
+            // matters more than a unique one.
+            registerGlobalHotKey()
+            return
+        }
+
+        if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+            hotKeyLockDescriptor = descriptor   // stay open: the lock lives with the fd
+            registerGlobalHotKey()
+            return
+        }
+
+        close(descriptor)
+        NSLog("VPNIndicator: another instance owns ⌘⇧P, standing by")
+        hotKeyStandbyTimer = Timer.scheduledTimer(timeInterval: 2.0,
+                                                  target: self,
+                                                  selector: #selector(retryHotKeyOwnership),
+                                                  userInfo: nil,
+                                                  repeats: true)
+    }
+
+    /// Runs in a standby instance: takes the shortcut over once the owner is gone.
+    @objc private func retryHotKeyOwnership() {
+        guard let descriptor = openHotKeyLockFile() else { return }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            close(descriptor)
+            return
+        }
+        hotKeyLockDescriptor = descriptor
+        hotKeyStandbyTimer?.invalidate()
+        hotKeyStandbyTimer = nil
+        NSLog("VPNIndicator: took over ⌘⇧P from a previous instance")
+        registerGlobalHotKey()
+    }
+
+    /// Opens (creating it if needed) the file whose exclusive lock means "this
+    /// process is the one that answers ⌘⇧P". Nil when it cannot be opened.
+    private func openHotKeyLockFile() -> Int32? {
+        guard let support = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                     in: .userDomainMask).first else {
+            return nil
+        }
+        let folder = support.appendingPathComponent("VPNIndicator", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let descriptor = open(folder.appendingPathComponent("hotkey.lock").path,
+                              O_CREAT | O_RDWR,
+                              0o644)
+        return descriptor >= 0 ? descriptor : nil
+    }
+
+    /// Installs the Carbon hot key. Only the lock owner should call this.
+    private func registerGlobalHotKey() {
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                       eventKind: UInt32(kEventHotKeyPressed))
 
@@ -496,9 +562,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                          0,
                                          &hotKeyRef)
         if status == noErr {
-            // Logged so a successful registration is verifiable after launch
-            // (Console.app, or: log show --predicate 'process == "VPNIndicator"').
-            NSLog("VPNIndicator: registered global hot key ⌘⇧P")
+            // Diagnostics go to stderr; launchd discards an app's stderr, so run
+            // the binary from a terminal to see this line.
+            NSLog("VPNIndicator: registered global hot key ⌘⇧P (hot key owner)")
         } else {
             // e.g. another app (or the system) already owns ⌘⇧P.
             NSLog("VPNIndicator: could not register ⌘⇧P (\(status))")
@@ -533,6 +599,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func quit() {
+        // Releasing the lock lets another instance pick up ⌘⇧P at once
+        // instead of on its next 2 s retry.
+        if hotKeyLockDescriptor >= 0 {
+            close(hotKeyLockDescriptor)
+            hotKeyLockDescriptor = -1
+        }
         NSApplication.shared.terminate(nil)
     }
 

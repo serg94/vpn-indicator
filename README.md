@@ -82,9 +82,12 @@ Launchd discards an app’s stderr, so to see them run the binary from a termina
 ~/Applications/VPNIndicator.app/Contents/MacOS/VPNIndicator
 ```
 
-The click-toggle keeps working even if the shortcut could not be registered. Note that macOS allows
-the same hot key to be registered by several processes, so running a second copy of the app (e.g.
-`open build/VPNIndicator.app`) makes both of them fire on one press — keep a single instance running.
+If several copies of the app are running, only **one** of them answers ⌘⇧P. Each instance tries to take
+an exclusive lock on `~/Library/Application Support/VPNIndicator/hotkey.lock` at launch, and only the lock
+owner registers the shortcut; the others stand by and take over within ~2 s if the owner quits (the
+kernel releases the lock when its owner dies). This is necessary because macOS delivers a registered
+hot key to *every* process that registered it — without the lock, one press would toggle the VPN once
+per running copy. The click-toggle keeps working even if registration fails.
 
 ## Customizing
 
